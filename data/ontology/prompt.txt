@@ -1,0 +1,238 @@
+# TASK: CHRONOLOGICAL MULTI-REPORT DEVICE ENTITY EXTRACTION
+
+You will receive multiple Chest X-ray reports from the **same patient**, ordered **chronologically** (earliest to latest). Each report is labeled with a `study_id` and `date`.
+
+Your task is to extract device information from **each report individually**, producing one JSON extraction per study. However, you MUST use the chronological context to resolve ambiguous or relative references across reports.
+
+**Context sources**: The chronological context may come from two sources:
+- **Within this batch**: Earlier reports in the batch that you can directly read.
+- **Prior Device Status summary**: When reports are processed in batches, a structured summary of the device status from the most recent study BEFORE this batch may be provided. Treat it as the ground truth for the state just before the first report in this batch.
+
+## CROSS-REPORT RESOLUTION RULES (CRITICAL)
+
+1. **"Unchanged" / "No Change" / "Stable" / "As before" / "No interval change"** (EXPLICIT mention required):
+   Carry forward devices from the prior study ONLY when the report **explicitly** uses comparative language about those devices, such as "unchanged", "no change", "stable in position", "as on prior", "lines/tubes unchanged", etc. In that case, look at the **most recent previous context** (either a prior report in this batch, or the Prior Device Status summary) to determine what devices were actually present and carry that information forward.
+   - This rule applies ONLY to devices covered by the explicit comparative statement. For example, "Lines and tubes are unchanged" covers lines and tubes but NOT cardiac devices.
+   - If a device was present in the prior study but the current report says NOTHING about it (neither names it nor includes it in any comparative statement), that device should be treated as **"Not Mentioned"** — do NOT silently carry it forward.
+
+2. **"Interval Removal" / "Removed" / "No longer seen" / "Discontinued"**:
+   If a report says a device was "removed", "interval removal", "no longer seen", "pulled back", or "discontinued" since the prior study, set `presence` to "No" for that device in the current study.
+
+3. **"New" / "Newly Placed" / "Interval Placement"**:
+   When a report mentions a "new" device or "interval placement", this confirms the device was NOT present in the preceding study and is NOW present.
+
+4. **No Cross-Reference / Silence about a device**:
+   If a report does not reference previous studies at all (e.g., it is the first study, or makes no comparative statements), extract purely based on its own content using the standard rules below. **Critically, if a device existed in a prior study but the current report simply does not mention it at all, do NOT assume it is still present — mark it as "Not Mentioned".**
+
+5. **Partial Reference**:
+   If a report says "Lines and tubes are unchanged" but also mentions a NEW device, carry forward all previously present devices **that fall under the scope of "lines and tubes"** AND add the new one. Devices outside the scope of the comparative statement that are not independently mentioned should be "Not Mentioned".
+
+# OUTPUT FORMAT
+Return a single JSON object where each top-level key is a study_id (e.g., "s50414267") and each value is a flat JSON object containing the per-device extraction.
+- The top-level keys must match the study_ids provided in the reports.
+- For each study's value, the inner keys are fixed device categories (see "Target JSON Schema" below).
+- For each device category, output a single object containing: `presence`, `location`, `attributes`, `evidential_segment`, and `presence_statement`.
+- NO lists/arrays within device objects.
+
+# PRESENCE ASSIGNMENT RULES (CRITICAL)
+Assign one of the following 4 statuses to EACH device category. Do not confuse "Uncertain" with "Not Mentioned".
+
+1. Yes:
+   - The device is explicitly reported as present/seen (e.g., "identified", "seen", "in place", "tip at SVC").
+   - OR inferred from usage context (e.g., "Intubated" implies Endotracheal Tube is "Yes").
+   - OR carried forward from the previous study when the current report says devices are "unchanged" (see Cross-Report Resolution Rules).
+
+2. No:
+   - Explicit negation regarding the specific device (e.g., "No pneumothorax or chest tube", "PICC removed").
+   - OR Logical Inference from "Global Negation": The report contains a broad negative statement such as "No tubes, lines, or foreign bodies" or "No active cardiopulmonary disease or hardware".
+   - OR Contextual Removal: "Extubated" implies Endotracheal Tube is "No".
+   - OR Interval Removal from a previous study (see Cross-Report Resolution Rules).
+
+3. Uncertain:
+   - The report mentions the device/object but describes it with ambiguity, probability, or conditional language.
+   - Keywords: "suggests", "possible", "cannot exclude", "suspicious for", "projection of", "questionable", "unclear if internal or external".
+
+4. Not Mentioned:
+   - The specific device category is not discussed in the text.
+   - AND there is no global negation (like "no lines") that would logically exclude it.
+   - AND there is no comparative statement (like "lines unchanged") that would carry forward a prior status.
+   - Example: If the report only talks about the lungs and heart, and says nothing about tubes/lines, all device categories should be "Not Mentioned".
+
+# GENERAL EXTRACTION LOGIC
+
+1. FLATTENED CATEGORIES (Strict Separation)
+   - Evaluate each category independently based on the "Device-Specific Rules" below.
+   - Do not cross-contaminate findings (e.g., do not label a PICC as a Conventional central venous catheter).
+
+2. HANDLING MULTIPLICITY (The "Merge" Rule)
+   - Since the output format requires a single object per category, if multiple devices of the SAME category are present (e.g., "Bilateral Chest Tubes" or "Right and Left PICCs"), you must MERGE them.
+   - Location Merging: Combine sides/sites. Example: "Right Internal Jugular and Left Subclavian".
+   - Attributes Merging: Combine attributes. Example: "Right tip at SVC, Left tip malpositioned".
+
+3. FIELD DEFINITIONS
+   - `presence`: "Yes", "No", "Uncertain", or "Not Mentioned".
+   - `location`: Combines the Side (Right/Left/Bilateral) and the Anatomical Site/Insertion Point. Output "NA" if presence is No/Not Mentioned.
+   - `attributes`: Captures properties such as status ("coiled", "kinked"), specific type ("pigtail", "dual-lumen"), or tip location ("tip at SVC"). Output "NA" if presence is No/Not Mentioned.
+   - IMPORTANT: `location` and `attributes` must describe the STATIC, PHYSICAL state of the device — NOT temporal comparisons with prior studies. Phrases like "Position constant", "Unchanged position", "Stable in position", "No interval change", "Similar to prior" are temporal observations and must NOT appear in `location` or `attributes`. Instead, record the actual anatomical location and physical properties. If the report only states a temporal comparison without specifying the actual location/attributes, carry forward the concrete values from the prior study context; if no prior context is available, output the most specific information available from the report.
+   - `evidential_segment`: Extract the specific clause or segment of the sentence describing the category from the original report. For devices carried forward via "unchanged" language, quote the comparative statement (e.g., "Lines and tubes are unchanged"). CRITICAL: If there are multiple relevant segments, combine them into a single string (separated by "; ").
+   - `presence_statement`: A grammatically correct, standalone sentence describing the device(s) with location and attributes (if any).
+     - CONSTRAINT 1 (Start Phrase): Must start with "There is" (for Yes/Uncertain) or "There is no" (for No/Not Mentioned).
+     - CONSTRAINT 2 (Direct Description): Do NOT reference the report, image, or study (e.g., NO "The report states...", NO "seen", NO "visualized"). Describe the reality directly.
+     - Examples:
+       - (Yes): "There is a right internal jugular central venous catheter with the tip at the SVC."
+       - (No): "There is no central venous catheter."
+       - (Uncertain): "There is a possible catheter projecting over the right neck."
+       - (Not Mentioned): "There is no central venous catheter."
+
+# DEVICE-SPECIFIC RULES & KEYWORDS
+
+1. AIRWAY TUBES
+- Endotracheal tube
+Keywords: "Endotracheal Tube", "ETT", "Endotracheal airway", "Intubated".
+Inference: If patient is "Intubated" or "Extubated" (implying presence/absence), map here.
+
+- Tracheostomy tube
+Keywords: "Tracheostomy", "Trach", "Tracheostomy tube", "Tracheal cannula", or tube entering via neck stoma.
+Exclusions: Do not confuse with Enteric tubes (NGT, Dobhoff).
+Absence: "Extubated", "tube removed", or "airway patent" = No.
+
+2. CENTRAL LINES AND PORTS
+- Conventional central venous catheter
+Keywords: "Central Venous Catheter", "CVC", "Central Line", "Triple/Double/Quad Lumen", "Hohn", "Cordis".
+Exclusions: Do not include PICCs, Port-A-Caths, Hemodialysis catheters, Pulmonary artery flotation catheter, or Midlines.
+
+- Hemodialysis catheter
+Keywords: "Dialysis catheter", "Hemodialysis", "Permcath", "Vascath", "Mahurkar", "Quinton".
+Anatomy: Right/Left side + Internal Jugular (IJ) / Subclavian (SC) / Femoral.
+
+- Port-A-Cath
+Keywords: "Port", "Port-a-cath", "Mediport", "Reservoir", "Chemoport", "TIVAD", "Implanted venous access device".
+
+- PICC
+Keywords: "PICC", "Peripherally Inserted Central Catheter", "PowerPICC", "Turbo-Ject", "Groshong PICC".
+Exclusions: Midline catheters (unless explicitly called PICC), Conventional central venous catheters.
+Logic: If "Bilateral PICCs" are mentioned, merge into one entry with location "Bilateral Arms".
+
+3. SPECIALTY VASCULAR CATHETERS
+- Pulmonary artery flotation catheter
+Keywords: "Swan-Ganz", "Pulmonary Artery Catheter", "PA Catheter", "PAC", "Flow-directed balloon-tipped catheter".
+Exclusions: Conventional central venous catheters, Introducer sheaths (if mentioned in isolation).
+
+4. CARDIAC ELECTRICAL DEVICES
+- Implantable cardiac pacemaker
+Keywords: "Pacemaker", "PPM", "Permanent pacemaker", "Generator" (implanted in pocket without defibrillator mention).
+Exclusions: "Implantable Loop Recorder", "ILR", "Reveal device" = No. Do not include ICDs here.
+
+- Implantable defibrillator
+Keywords: "ICD", "AICD", "Defibrillator", "Bi-V ICD".
+
+- Temporary pacemaker
+Keywords: "Temporary pacemaker", "Temporary pacing wire", "Transvenous pacer", external wires without implanted generator.
+
+5. DRAINS
+- Chest tube
+Keywords: "Chest Tube", "Thoracostomy Tube", "Pleural Drain", "Pigtail Catheter" (in pleural space), "Intercostal Drain".
+Exclusions: Vascular lines, Cardiac leads, Mediastinal/Blake drains (unless explicitly treating pneumothorax/effusion).
+Status: "Tube removed" or "Post-removal" = No.
+
+6. ENTERAL TUBES
+- Enteral tube
+Keywords: "Nasogastric Tube", "NGT", "Levin", "Salem Sump", "Decompression tube", "Orogastric Tube", "OGT", "Dobhoff", "Keofeed", "Weighted tube", "Small-bore tube", "Nasoenteric tube", "Feeding tube", "Gastric tube".
+Inference: "Tip in stomach/duodenum" implies presence. "Interval removal" = No.
+
+# TARGET JSON SCHEMA
+Provide the output strictly as a valid JSON object. START your response with { and END with }.
+
+The top-level keys are the study_ids. Each study's value follows this device extraction schema:
+
+{
+  "s<study_id_1>": {
+    "Endotracheal tube": {
+      "presence": "Yes / No / Uncertain / Not Mentioned",
+      "location": "Trachea / etc.",
+      "attributes": "Distance from carina / Malpositioned / etc.",
+      "evidential_segment": "Extracted text snippet / NA",
+      "presence_statement": "Full descriptive sentence."
+    },
+    "Tracheostomy tube": {
+      "presence": "Yes / No / Uncertain / Not Mentioned",
+      "location": "Midline Neck / Stoma / etc.",
+      "attributes": "Granulation / Dislodged / etc.",
+      "evidential_segment": "Extracted text snippet / NA",
+      "presence_statement": "Full descriptive sentence."
+    },
+    "Hemodialysis catheter": {
+      "presence": "Yes / No / Uncertain / Not Mentioned",
+      "location": "Right IJ / Left Subclavian / etc.",
+      "attributes": "Permacath / Vascath / Tip location / etc.",
+      "evidential_segment": "Extracted text snippet / NA",
+      "presence_statement": "Full descriptive sentence."
+    },
+    "Port-A-Cath": {
+      "presence": "Yes / No / Uncertain / Not Mentioned",
+      "location": "Right Chest Wall / Left Subclavian / etc.",
+      "attributes": "Port-A-Cath / Implanted port / etc.",
+      "evidential_segment": "Extracted text snippet / NA",
+      "presence_statement": "Full descriptive sentence."
+    },
+    "Pulmonary artery flotation catheter": {
+      "presence": "Yes / No / Uncertain / Not Mentioned",
+      "location": "Right IJ / Pulmonary Artery / etc.",
+      "attributes": "Tip in right main PA / Coiled / Balloon inflated / etc.",
+      "evidential_segment": "Extracted text snippet / NA",
+      "presence_statement": "Full descriptive sentence."
+    },
+    "PICC": {
+      "presence": "Yes / No / Uncertain / Not Mentioned",
+      "location": "Right Arm / Left Basilic Vein / Bilateral / etc.",
+      "attributes": "Tip at SVC / Malpositioned / Coiled / etc.",
+      "evidential_segment": "Extracted text snippet / NA",
+      "presence_statement": "Full descriptive sentence."
+    },
+    "Conventional central venous catheter": {
+      "presence": "Yes / No / Uncertain / Not Mentioned",
+      "location": "Right IJ / Left Subclavian / Bilateral / etc.",
+      "attributes": "Tip location / Triple-lumen / etc.",
+      "evidential_segment": "Extracted text snippet / NA",
+      "presence_statement": "Full descriptive sentence."
+    },
+    "Implantable cardiac pacemaker": {
+      "presence": "Yes / No / Uncertain / Not Mentioned",
+      "location": "Left Chest Wall / Pouch / etc.",
+      "attributes": "Biventricular / Leads intact / Lead fracture / etc.",
+      "evidential_segment": "Extracted text snippet / NA",
+      "presence_statement": "Full descriptive sentence."
+    },
+    "Implantable defibrillator": {
+      "presence": "Yes / No / Uncertain / Not Mentioned",
+      "location": "Left Chest Wall / Pouch / etc.",
+      "attributes": "Biventricular / Leads intact / Lead fracture / etc.",
+      "evidential_segment": "Extracted text snippet / NA",
+      "presence_statement": "Full descriptive sentence."
+    },
+    "Temporary pacemaker": {
+      "presence": "Yes / No / Uncertain / Not Mentioned",
+      "location": "Right Internal Jugular / Transvenous / etc.",
+      "attributes": "Tip position / Wire intact / etc.",
+      "evidential_segment": "Extracted text snippet / NA",
+      "presence_statement": "Full descriptive sentence."
+    },
+    "Chest tube": {
+      "presence": "Yes / No / Uncertain / Not Mentioned",
+      "location": "Right Pleural Space / Bilateral / etc.",
+      "attributes": "Pigtail / Large bore / Kinked / etc.",
+      "evidential_segment": "Extracted text snippet / NA",
+      "presence_statement": "Full descriptive sentence."
+    },
+    "Enteral tube": {
+      "presence": "Yes / No / Uncertain / Not Mentioned",
+      "location": "Esophagus / Stomach / etc.",
+      "attributes": "Nasogastric Tube / Orogastric Tube / Feeding Tube / Tip below diaphragm / Coiled / etc.",
+      "evidential_segment": "Extracted text snippet / NA",
+      "presence_statement": "Full descriptive sentence."
+    }
+  },
+  "s<study_id_2>": {
+    ...same device categories...
+  }
+}
